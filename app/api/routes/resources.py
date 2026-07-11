@@ -1,91 +1,172 @@
 """
-Resource management endpoints
+Resource management endpoints with database integration
 """
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi import APIRouter, HTTPException, Query, Depends, status
+from sqlalchemy.orm import Session
+from typing import List
+from app.schemas import ResourceCreate, ResourceUpdate, ResourceResponse
+from app.models.resource import Resource
+from app.database import get_db
 from app.logger import logger
 
 router = APIRouter()
 
-class Resource(BaseModel):
-    """Resource model"""
-    id: int
-    name: str
-    resource_type: str
-    latitude: float
-    longitude: float
-    status: str
-    description: Optional[str] = None
-
-class ResourceCreate(BaseModel):
-    """Create resource model"""
-    name: str
-    resource_type: str
-    latitude: float
-    longitude: float
-    status: str
-    description: Optional[str] = None
-
-# In-memory storage (replace with database in production)
-resources_db: List[Resource] = [
-    Resource(id=1, name="School A", resource_type="School", latitude=20.593, longitude=78.963, status="Active", description="Primary School"),
-    Resource(id=2, name="Hospital B", resource_type="Hospital", latitude=20.595, longitude=78.961, status="Active", description="General Hospital"),
-]
-
-@router.get("/", response_model=List[Resource])
+@router.get("/", response_model=List[ResourceResponse])
 async def get_resources(
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100),
-    resource_type: Optional[str] = None
+    resource_type: str = Query(None),
+    db: Session = Depends(get_db)
 ):
-    """Get all resources"""
-    logger.info(f"Fetching resources: skip={skip}, limit={limit}, type={resource_type}")
-    
-    filtered = resources_db
-    if resource_type:
-        filtered = [r for r in filtered if r.resource_type == resource_type]
-    
-    return filtered[skip:skip + limit]
+    """Get all resources with optional filtering"""
+    try:
+        query = db.query(Resource)
+        
+        if resource_type:
+            query = query.filter(Resource.resource_type == resource_type)
+        
+        resources = query.offset(skip).limit(limit).all()
+        logger.info(f"Fetched {len(resources)} resources")
+        return resources
+    except Exception as e:
+        logger.error(f"Error fetching resources: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error fetching resources")
 
-@router.get("/{resource_id}", response_model=Resource)
-async def get_resource(resource_id: int):
-    """Get specific resource"""
-    for resource in resources_db:
-        if resource.id == resource_id:
-            logger.info(f"Resource {resource_id} retrieved")
-            return resource
-    raise HTTPException(status_code=404, detail="Resource not found")
+@router.get("/{resource_id}", response_model=ResourceResponse)
+async def get_resource(resource_id: int, db: Session = Depends(get_db)):
+    """Get specific resource by ID"""
+    try:
+        resource = db.query(Resource).filter(Resource.id == resource_id).first()
+        if not resource:
+            logger.warning(f"Resource {resource_id} not found")
+            raise HTTPException(status_code=404, detail="Resource not found")
+        return resource
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching resource {resource_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error fetching resource")
 
-@router.post("/", response_model=Resource, status_code=201)
-async def create_resource(resource: ResourceCreate):
+@router.post("/", response_model=ResourceResponse, status_code=status.HTTP_201_CREATED)
+async def create_resource(resource: ResourceCreate, db: Session = Depends(get_db)):
     """Create new resource"""
-    new_resource = Resource(
-        id=len(resources_db) + 1,
-        **resource.dict()
-    )
-    resources_db.append(new_resource)
-    logger.info(f"Resource {new_resource.id} created: {new_resource.name}")
-    return new_resource
+    try:
+        db_resource = Resource(
+            name=resource.name,
+            resource_type=resource.resource_type,
+            latitude=resource.latitude,
+            longitude=resource.longitude,
+            status=resource.status,
+            description=resource.description,
+            verified=False,
+            quality_score=0.0
+        )
+        db.add(db_resource)
+        db.commit()
+        db.refresh(db_resource)
+        logger.info(f"Created resource {db_resource.id}: {resource.name}")
+        return db_resource
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating resource: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error creating resource")
 
-@router.put("/{resource_id}", response_model=Resource)
-async def update_resource(resource_id: int, resource: ResourceCreate):
-    """Update resource"""
-    for i, existing in enumerate(resources_db):
-        if existing.id == resource_id:
-            updated = Resource(id=resource_id, **resource.dict())
-            resources_db[i] = updated
-            logger.info(f"Resource {resource_id} updated")
-            return updated
-    raise HTTPException(status_code=404, detail="Resource not found")
+@router.put("/{resource_id}", response_model=ResourceResponse)
+async def update_resource(
+    resource_id: int,
+    resource: ResourceUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update existing resource"""
+    try:
+        db_resource = db.query(Resource).filter(Resource.id == resource_id).first()
+        if not db_resource:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        
+        # Update fields that are provided
+        update_data = resource.dict(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(db_resource, field, value)
+        
+        db.commit()
+        db.refresh(db_resource)
+        logger.info(f"Updated resource {resource_id}")
+        return db_resource
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating resource {resource_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error updating resource")
 
-@router.delete("/{resource_id}", status_code=204)
-async def delete_resource(resource_id: int):
+@router.delete("/{resource_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_resource(resource_id: int, db: Session = Depends(get_db)):
     """Delete resource"""
-    for i, resource in enumerate(resources_db):
-        if resource.id == resource_id:
-            resources_db.pop(i)
-            logger.info(f"Resource {resource_id} deleted")
-            return
-    raise HTTPException(status_code=404, detail="Resource not found")
+    try:
+        db_resource = db.query(Resource).filter(Resource.id == resource_id).first()
+        if not db_resource:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        
+        db.delete(db_resource)
+        db.commit()
+        logger.info(f"Deleted resource {resource_id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting resource {resource_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error deleting resource")
+
+@router.post("/search/by-bbox")
+async def search_by_bbox(
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+    db: Session = Depends(get_db)
+):
+    """Search resources within bounding box"""
+    try:
+        resources = db.query(Resource).filter(
+            Resource.latitude >= min_lat,
+            Resource.latitude <= max_lat,
+            Resource.longitude >= min_lon,
+            Resource.longitude <= max_lon
+        ).all()
+        
+        logger.info(f"Found {len(resources)} resources in bbox")
+        return {
+            "count": len(resources),
+            "resources": resources
+        }
+    except Exception as e:
+        logger.error(f"Error searching bbox: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error searching resources")
+
+@router.get("/stats/by-type")
+async def get_stats_by_type(db: Session = Depends(get_db)):
+    """Get resource statistics by type"""
+    try:
+        from sqlalchemy import func
+        
+        stats = db.query(
+            Resource.resource_type,
+            func.count(Resource.id).label("count"),
+            func.avg(Resource.quality_score).label("avg_quality")
+        ).group_by(Resource.resource_type).all()
+        
+        result = [
+            {
+                "type": s[0],
+                "count": s[1],
+                "avg_quality": float(s[2]) if s[2] else 0.0
+            }
+            for s in stats
+        ]
+        
+        logger.info(f"Retrieved stats for {len(result)} resource types")
+        return result
+    except Exception as e:
+        logger.error(f"Error getting stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error retrieving statistics")
